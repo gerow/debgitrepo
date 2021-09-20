@@ -14,14 +14,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-git/go-git/v5"
 	"github.com/ulikunitz/xz"
-	"gopkg.in/src-d/go-git.v4"
 	"pault.ag/go/debian/control"
 	"pault.ag/go/debian/version"
 )
 
 const (
-	timeLayout = "20060102T030405Z"
+	timeLayout = "20060102T150405Z"
 )
 
 // This is all very hacky. http://bugs.debian.org/969605 proposes a way to
@@ -113,13 +113,14 @@ func sourceName(pkg control.BinaryIndex) string {
 	return strings.SplitN(src, " ", 2)[0]
 }
 
-func writeBinPkgs(repoPath, dist, component, arch string, pkgs []control.BinaryIndex) error {
+func writeBinPkgs(wt *git.Worktree, dist, component, arch string, pkgs []control.BinaryIndex) error {
+	fs := wt.Filesystem
 	src := sourceName(pkgs[0])
-	loc := path.Join(repoPath, dist, component, dirForSource(src), "binary-"+arch)
-	if err := os.MkdirAll(path.Dir(loc), 0777); err != nil {
+	loc := path.Join(dist, component, dirForSource(src), "binary-"+arch)
+	if err := fs.MkdirAll(path.Dir(loc), 0777); err != nil {
 		return fmt.Errorf("failed to create directories for %s: %w", src, err)
 	}
-	f, err := os.OpenFile(loc, os.O_WRONLY|os.O_CREATE, 0666)
+	f, err := fs.OpenFile(loc, os.O_WRONLY|os.O_CREATE, 0666)
 	if err != nil {
 		return fmt.Errorf("failed to open %q: %w", loc, err)
 	}
@@ -154,56 +155,86 @@ func run() error {
 		repoPath  = "/home/gerow/debgit-test"
 	)
 
-	/*
-		storage := filesystem.NewStorage(osfs.New("/home/gerow/debgit-test/.git"), nil)
-		_, err = git.Init(storage, osfs.New("/home/gerow/debgit-test"))
-		if err != nil {
-			return fmt.Errorf("failed to init repo: %w", err)
-		}
-		return nil
-	*/
-	_, err = git.PlainInit(repoPath, false)
+	repo, err := git.PlainInit(repoPath, false)
 	if err != nil {
 		return fmt.Errorf("failed to init repo: %w", err)
 	}
 
-	r, err := streamPackages(t, dist, component, arch)
-	if err != nil {
-		return fmt.Errorf("failed to start streaming packagaes: %w", err)
-	}
-	defer r.Close()
-	// It might be nice to be able to stream this instead, but really it isn't a big deal.
-	idx, err := control.ParseBinaryIndex(bufio.NewReader(r))
-	if err != nil {
-		return fmt.Errorf("failed to parse binary Packages index: %w", err)
-	}
-	// We'll probably already be sorted somewhat like this, but just to be sure.
-	// Sort by source name, package name, and then version.
-	sort.Slice(idx, func(i, j int) bool {
-		a, b := idx[i], idx[j]
-		sa, sb := sourceName(a), sourceName(b)
-		if sa != sb {
-			return sa < sb
-		}
-		if pa, pb := a.Package, b.Package; pa != pb {
-			return pa < pb
-		}
-		return version.Compare(a.Version, b.Version) < 0
-	})
-
-	binPkgs := []control.BinaryIndex{idx[0]}
-	src := sourceName(idx[0])
-	for _, pkg := range idx[1:] {
-		if pkg.Source != "" && pkg.Source == src {
-			binPkgs = append(binPkgs, pkg)
-		} else {
-			if err := writeBinPkgs(repoPath, dist, component, arch, binPkgs); err != nil {
-				return err
+	for {
+		// XXX(gerow) we're skipping the first one now
+		t2 := t.Add(6 * time.Hour)
+		for {
+			tCandidate, err := closestSnapshotTime(t2)
+			if err != nil {
+				return fmt.Errorf("failed to get next snapshot time: %w", err)
 			}
-			binPkgs = []control.BinaryIndex{pkg}
-			src = sourceName(pkg)
+			if tCandidate.Equal(t) || tCandidate.Before(t) {
+				t2 = t2.Add(6 * time.Hour)
+				continue
+			} else {
+				if t2.After(end) {
+					goto done
+				}
+				break
+			}
+		}
+		t = t2
+		log.Printf("working on snapshot %v", t)
+
+		r, err := streamPackages(t, dist, component, arch)
+		if err != nil {
+			return fmt.Errorf("failed to start streaming packagaes: %w", err)
+		}
+		defer r.Close()
+		// It might be nice to be able to stream this instead, but really it isn't a big deal.
+		idx, err := control.ParseBinaryIndex(bufio.NewReader(r))
+		if err != nil {
+			return fmt.Errorf("failed to parse binary Packages index: %w", err)
+		}
+		// We'll probably already be sorted somewhat like this, but just to be sure.
+		// Sort by source name, package name, and then version.
+		sort.Slice(idx, func(i, j int) bool {
+			a, b := idx[i], idx[j]
+			sa, sb := sourceName(a), sourceName(b)
+			if sa != sb {
+				return sa < sb
+			}
+			if pa, pb := a.Package, b.Package; pa != pb {
+				return pa < pb
+			}
+			return version.Compare(a.Version, b.Version) < 0
+		})
+
+		wt, err := repo.Worktree()
+		if err != nil {
+			return fmt.Errorf("failed to get worktree for git repo: %w", err)
+		}
+		_, err = wt.Remove("/")
+		if err != nil {
+			return fmt.Errorf("failed to remove all: %w", err)
+		}
+		binPkgs := []control.BinaryIndex{idx[0]}
+		src := sourceName(idx[0])
+		for _, pkg := range idx[1:] {
+			if pkg.Source != "" && pkg.Source == src {
+				binPkgs = append(binPkgs, pkg)
+			} else {
+				if err := writeBinPkgs(wt, dist, component, arch, binPkgs); err != nil {
+					return err
+				}
+				binPkgs = []control.BinaryIndex{pkg}
+				src = sourceName(pkg)
+			}
+		}
+		if err := wt.AddWithOptions(&git.AddOptions{All: true}); err != nil {
+			return fmt.Errorf("failed to add: %w", err)
+		}
+		_, err = wt.Commit("snapshot at %s"+t.Format(timeLayout), &git.CommitOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to commit: %w", err)
 		}
 	}
+done:
 
 	return nil
 }
